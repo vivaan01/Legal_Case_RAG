@@ -60,3 +60,183 @@ Memory is handled to maintain conversation context, making the system stateful (
 - Tools : Memory tools from `memory_tools.py` (note: path might be under backend) allow the LLM to query past conversations if needed.
 - Data Flow in Memory : Query → Load History → Include in Prompt → Generate Response → Save New Message → Persist (e.g., in-memory or file-based for persistence).
 - Management : History is limited to avoid token overflow (e.g., buffer size), and it's user-specific for privacy.
+
+
+### How Data Gets Saved in Memory: From PDF Ingestion to Model Working
+I'll explain this step by step based on the project's codebase. This Legal Case RAG system processes PDF documents (e.g., legal rulings) through ingestion, stores them in a hybrid way (vector embeddings for semantic search and BM25 for keyword search), and uses them in a Retrieval-Augmented Generation (RAG) pipeline powered by an Ollama LLM. "Memory" here refers to two things:
+
+- Data storage for retrieval : Chunks of PDF text saved in an in-memory vector store (DocArray) and a pickled BM25 index on disk.
+- Conversation memory : A separate manager that tracks query history and extracts key entities (e.g., case types like "contract dispute") into a dictionary for context-aware responses.
+This is drawn from key files like `retrieval.py` , `routes.py` , `rag_chain.py` , and the `README.md` . Note: The vector store is rebuilt in-memory on each ingest or query, so it's not persistently "saved" to disk like the BM25 index—it's efficient for quick local use but resets on app restart.
+ 1. PDF Ingestion Process
+Ingestion happens when you upload a PDF via the Streamlit UI ( `app.py` ) or directly via the API (e.g., /ingest endpoint). Here's the flow:
+
+- Upload and Temporary Storage :
+  
+  - The PDF is uploaded to the backend (FastAPI server).
+  - It's saved temporarily to the data/ directory (e.g., data/upload_{filename}.pdf ). This path is configured in `settings.py` as DATA_DIR (default: data/ ).
+  - Example: If you upload "Ram_Mandir_Judgment.pdf", it's written to disk as a binary file.
+- Loading and Chunking the PDF :
+  
+  - The system uses LangChain's PyPDFLoader to read the PDF content (from `retrieval.py` ).
+  - Raw text is extracted page-by-page into Document objects (each with page_content and metadata like page number).
+  - Text is split into smaller chunks using RecursiveCharacterTextSplitter :
+    - Chunk size: 900 characters (to keep chunks manageable for embedding).
+    - Overlap: 150 characters (to preserve context across chunks).
+  - Result: A list of Document objects, e.g., one PDF might become 50-100 chunks depending on length.
+- Updating the BM25 Index (Keyword-Based Search) :
+  
+  - BM25 is a sparse retrieval method for exact keyword matching.
+  - If an existing BM25 index exists (as a pickle file at data/bm25_docs.pkl ), it's loaded.
+  - New chunks from the PDF are appended to the existing ones.
+  - The combined list is pickled (serialized) back to data/bm25_docs.pkl for persistence on disk.
+  - A BM25Retriever is created or updated with these documents (sets k=6 to retrieve top 6 matches).
+- Building the Vector Store (Semantic Search) :
+  
+  - Uses Ollama embeddings (via OllamaEmbeddings from `llm.py` , default model: "nomic-embed-text").
+  - Chunks are embedded into vectors (numerical representations) and stored in an in-memory DocArrayInMemorySearch vector store.
+  - This is rebuilt fresh during ingestion or queries—it's not saved to disk, so it's fast but ephemeral (lost on restart).
+  - The system creates a hybrid retriever: EnsembleRetriever combining vector search (55% weight) and BM25 (45% weight), retrieving top 6 from each.
+- Ingestion Response :
+  
+  - Returns stats like number of new chunks, total BM25 docs, and whether the vector store was updated.
+  - If errors occur (e.g., invalid PDF), it raises an HTTP error.
+At this point, data is "saved" as:
+
+- Persistent : Raw PDF in data/ , BM25 index in bm25_docs.pkl .
+- In-Memory : Vector embeddings in DocArray (recreated as needed). 2. How Data is Saved in Memory
+- In-Memory Vector Store (DocArray) :
+  
+  - Not truly "saved" to disk—it's an in-memory database rebuilt from the BM25 pickle's documents during queries.
+  - Why? Efficiency for local dev; vectors are recomputed quickly via Ollama (local LLM server at http://localhost:11434 ).
+  - Storage: Each chunk's text is embedded into a vector (e.g., 768-dimensional array) and indexed for similarity search.
+- BM25 Index on Disk :
+  
+  - Saved as a Python pickle file ( bm25_docs.pkl ), which serializes the list of Document objects.
+  - This acts as the "memory" backbone—load it, rebuild vectors if needed.
+- Conversation Memory (MemoryManager) :
+  
+  - Separate from document data. Manages query history per user (e.g., "default_user").
+  - Extracts entities like "case_type" (e.g., "contract") into a dict for contextual responses.
+  - Stored in-memory (not on disk), built on-the-fly from past queries.
+  - Used in the RAG chain to include history in prompts.
+- No Database for Documents : Unlike production systems, this uses in-memory + pickle for simplicity. Redis is only for feedback ratings (as explained previously), not document storage. 3. How the Model Works (RAG Pipeline)
+The "model" here is the end-to-end RAG system: Retrieval (fetch relevant chunks) + Generation (LLM answers using those chunks). It uses Ollama's LLM (default: "mistral:7b") with LangChain chains.
+
+- Query Submission :
+  
+  - From UI or API (e.g., /query or /query_stream ).
+  - Includes user query and history from MemoryManager.
+- Retrieval Step :
+  
+  - Hybrid retriever fetches top chunks:
+    - Vector search: Finds semantically similar chunks (e.g., via cosine similarity on embeddings).
+    - BM25: Finds keyword matches.
+    - Combines results into a context string (chunks joined with "---").
+- Generation Step (RAG Chain) :
+  
+  - Builds a chain in `rag_chain.py` :
+    - Prompt: System message + history + query + context.
+    - LLM (Ollama) generates response, optionally using tools like citation_lookup (mock tool for case citations).
+  - For streaming: Responses are sent token-by-token (e.g., via /query_stream ).
+  - Adaptive features: If feedback rating <3, it "heals" by refining the query and re-running the chain.
+- Output :
+  
+  - Answer with sources/metadata.
+  - Memory updated with the new query/response for future context. Example Flow
+1. Upload PDF → Chunks created → Appended to bm25_docs.pkl → Vectors built in-memory.
+2. Query: "Breach damages?" → Retrieve chunks from hybrid index → LLM generates answer using context + history.
+3. Rate low → Heal: Refine query, re-retrieve, re-generate.
+
+
+
+
+
+
+
+
+### How Data Gets Saved in Memory: From PDF Ingestion to Model Working
+I'll explain this step by step based on the project's codebase. This Legal Case RAG system processes PDF documents (e.g., legal rulings) through ingestion, stores them in a hybrid way (vector embeddings for semantic search and BM25 for keyword search), and uses them in a Retrieval-Augmented Generation (RAG) pipeline powered by an Ollama LLM. "Memory" here refers to two things:
+
+- Data storage for retrieval : Chunks of PDF text saved in an in-memory vector store (DocArray) and a pickled BM25 index on disk.
+- Conversation memory : A separate manager that tracks query history and extracts key entities (e.g., case types like "contract dispute") into a dictionary for context-aware responses.
+This is drawn from key files like `retrieval.py` , `routes.py` , `rag_chain.py` , and the `README.md` . Note: The vector store is rebuilt in-memory on each ingest or query, so it's not persistently "saved" to disk like the BM25 index—it's efficient for quick local use but resets on app restart.
+ 1. PDF Ingestion Process
+Ingestion happens when you upload a PDF via the Streamlit UI ( `app.py` ) or directly via the API (e.g., /ingest endpoint). Here's the flow:
+
+- Upload and Temporary Storage :
+  
+  - The PDF is uploaded to the backend (FastAPI server).
+  - It's saved temporarily to the data/ directory (e.g., data/upload_{filename}.pdf ). This path is configured in `settings.py` as DATA_DIR (default: data/ ).
+  - Example: If you upload "Ram_Mandir_Judgment.pdf", it's written to disk as a binary file.
+- Loading and Chunking the PDF :
+  
+  - The system uses LangChain's PyPDFLoader to read the PDF content (from `retrieval.py` ).
+  - Raw text is extracted page-by-page into Document objects (each with page_content and metadata like page number).
+  - Text is split into smaller chunks using RecursiveCharacterTextSplitter :
+    - Chunk size: 900 characters (to keep chunks manageable for embedding).
+    - Overlap: 150 characters (to preserve context across chunks).
+  - Result: A list of Document objects, e.g., one PDF might become 50-100 chunks depending on length.
+- Updating the BM25 Index (Keyword-Based Search) :
+  
+  - BM25 is a sparse retrieval method for exact keyword matching.
+  - If an existing BM25 index exists (as a pickle file at data/bm25_docs.pkl ), it's loaded.
+  - New chunks from the PDF are appended to the existing ones.
+  - The combined list is pickled (serialized) back to data/bm25_docs.pkl for persistence on disk.
+  - A BM25Retriever is created or updated with these documents (sets k=6 to retrieve top 6 matches).
+- Building the Vector Store (Semantic Search) :
+  
+  - Uses Ollama embeddings (via OllamaEmbeddings from `llm.py` , default model: "nomic-embed-text").
+  - Chunks are embedded into vectors (numerical representations) and stored in an in-memory DocArrayInMemorySearch vector store.
+  - This is rebuilt fresh during ingestion or queries—it's not saved to disk, so it's fast but ephemeral (lost on restart).
+  - The system creates a hybrid retriever: EnsembleRetriever combining vector search (55% weight) and BM25 (45% weight), retrieving top 6 from each.
+- Ingestion Response :
+  
+  - Returns stats like number of new chunks, total BM25 docs, and whether the vector store was updated.
+  - If errors occur (e.g., invalid PDF), it raises an HTTP error.
+At this point, data is "saved" as:
+
+- Persistent : Raw PDF in data/ , BM25 index in bm25_docs.pkl .
+- In-Memory : Vector embeddings in DocArray (recreated as needed). 2. How Data is Saved in Memory
+- In-Memory Vector Store (DocArray) :
+  
+  - Not truly "saved" to disk—it's an in-memory database rebuilt from the BM25 pickle's documents during queries.
+  - Why? Efficiency for local dev; vectors are recomputed quickly via Ollama (local LLM server at http://localhost:11434 ).
+  - Storage: Each chunk's text is embedded into a vector (e.g., 768-dimensional array) and indexed for similarity search.
+- BM25 Index on Disk :
+  
+  - Saved as a Python pickle file ( bm25_docs.pkl ), which serializes the list of Document objects.
+  - This acts as the "memory" backbone—load it, rebuild vectors if needed.
+- Conversation Memory (MemoryManager) :
+  
+  - Separate from document data. Manages query history per user (e.g., "default_user").
+  - Extracts entities like "case_type" (e.g., "contract") into a dict for contextual responses.
+  - Stored in-memory (not on disk), built on-the-fly from past queries.
+  - Used in the RAG chain to include history in prompts.
+- No Database for Documents : Unlike production systems, this uses in-memory + pickle for simplicity. Redis is only for feedback ratings (as explained previously), not document storage. 3. How the Model Works (RAG Pipeline)
+The "model" here is the end-to-end RAG system: Retrieval (fetch relevant chunks) + Generation (LLM answers using those chunks). It uses Ollama's LLM (default: "mistral:7b") with LangChain chains.
+
+- Query Submission :
+  
+  - From UI or API (e.g., /query or /query_stream ).
+  - Includes user query and history from MemoryManager.
+- Retrieval Step :
+  
+  - Hybrid retriever fetches top chunks:
+    - Vector search: Finds semantically similar chunks (e.g., via cosine similarity on embeddings).
+    - BM25: Finds keyword matches.
+    - Combines results into a context string (chunks joined with "---").
+- Generation Step (RAG Chain) :
+  
+  - Builds a chain in `rag_chain.py` :
+    - Prompt: System message + history + query + context.
+    - LLM (Ollama) generates response, optionally using tools like citation_lookup (mock tool for case citations).
+  - For streaming: Responses are sent token-by-token (e.g., via /query_stream ).
+  - Adaptive features: If feedback rating <3, it "heals" by refining the query and re-running the chain.
+- Output :
+  
+  - Answer with sources/metadata.
+  - Memory updated with the new query/response for future context. Example Flow
+1. Upload PDF → Chunks created → Appended to bm25_docs.pkl → Vectors built in-memory.
+2. Query: "Breach damages?" → Retrieve chunks from hybrid index → LLM generates answer using context + history.
+3. Rate low → Heal: Refine query, re-retrieve, re-generate.
